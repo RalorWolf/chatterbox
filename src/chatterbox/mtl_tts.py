@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import logging
 
 import librosa
 import torch
@@ -17,6 +18,8 @@ from .models.tokenizers import MTLTokenizer
 from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
 
+
+logger = logging.getLogger(__name__)
 
 REPO_ID = "ResembleAI/chatterbox"
 
@@ -73,8 +76,8 @@ def punc_norm(text: str) -> str:
         ("—", "-"),
         ("–", "-"),
         (" ,", ","),
-        ("“", "\""),
-        ("”", "\""),
+        ("“", '"'),
+        ("”", '"'),
         ("‘", "'"),
         ("’", "'"),
     ]
@@ -203,9 +206,55 @@ class ChatterboxMultilingualTTS:
         )
         return cls.from_local(ckpt_dir, device)
     
+    def _resolve_prompt_path(self, wav_fpath: str) -> str:
+        """Resolve a provided wav path to a file visible to this service.
+
+        Strategy:
+        - If the provided path exists, use it.
+        - Otherwise, try mapping basename into common mountpoint /app/voice_references.
+        - Log every attempt for debugging.
+        """
+        if not wav_fpath:
+            return wav_fpath
+
+        try_paths = [wav_fpath]
+        # If user provided a host path with voice_references segment, try mapping to container path
+        basename = os.path.basename(wav_fpath)
+        try_paths.append(os.path.join('/app/voice_references', basename))
+        try_paths.append(os.path.join('voice_references', basename))
+
+        for p in try_paths:
+            if os.path.exists(p):
+                resolved = os.path.abspath(p)
+                logger.debug(f"Resolved audio_prompt_path: input='{wav_fpath}' -> resolved='{resolved}'")
+                return resolved
+
+        # Nothing found — log intended attempts for diagnostics
+        logger.debug(f"Could not resolve audio_prompt_path='{wav_fpath}'. Tried: {try_paths}")
+        return wav_fpath
+
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
         ## Load reference wav
-        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+        resolved_path = self._resolve_prompt_path(wav_fpath)
+        logger.info(f"Preparing conditionals from path: {wav_fpath} -> resolved: {resolved_path}")
+
+        if not os.path.exists(resolved_path):
+            logger.error(f"Reference audio file not found at resolved path: {resolved_path}")
+            raise FileNotFoundError(f"Reference audio file not found: {resolved_path}")
+
+        try:
+            s3gen_ref_wav, _sr = librosa.load(resolved_path, sr=S3GEN_SR)
+        except Exception as e:
+            logger.exception(f"Failed to load reference audio '{resolved_path}': {e}")
+            raise
+
+        file_size = None
+        try:
+            file_size = os.path.getsize(resolved_path)
+        except Exception:
+            pass
+
+        logger.info(f"Loaded reference audio '{resolved_path}' size={file_size} bytes sample_rate={S3GEN_SR} samples={len(s3gen_ref_wav)}")
 
         ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
 
@@ -230,6 +279,13 @@ class ChatterboxMultilingualTTS:
         ).to(device=self.device)
         self.conds = Conditionals(t3_cond, s3gen_ref_dict)
 
+        # Log conditionals sizes for diagnostics
+        try:
+            gen_len = {k: (v.shape if torch.is_tensor(v) else (len(v) if hasattr(v, '__len__') else str(type(v)))) for k, v in self.conds.gen.items()}
+        except Exception:
+            gen_len = {k: str(type(v)) for k, v in self.conds.gen.items()}
+        logger.info(f"Prepared conditionals: t3_tokens_shape={(t3_cond_prompt_tokens.shape if t3_cond_prompt_tokens is not None else None)}, ve_embed_shape={ve_embed.shape}, gen_keys={list(self.conds.gen.keys())}, gen_summary={gen_len}")
+
     def generate(
         self,
         text,
@@ -251,7 +307,14 @@ class ChatterboxMultilingualTTS:
             )
         
         if audio_prompt_path:
-            self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            try:
+                resolved = self._resolve_prompt_path(audio_prompt_path)
+                logger.info(f"generate() using audio_prompt_path: input='{audio_prompt_path}' resolved='{resolved}'")
+                self.prepare_conditionals(resolved, exaggeration=exaggeration)
+            except Exception as e:
+                logger.exception(f"Error preparing conditionals for audio_prompt_path='{audio_prompt_path}': {e}")
+                # Re-raise so caller can handle
+                raise
         else:
             assert self.conds is not None, "Please `prepare_conditionals` first or specify `audio_prompt_path`"
 
@@ -273,6 +336,8 @@ class ChatterboxMultilingualTTS:
         eot = self.t3.hp.stop_text_token
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+        logger.debug(f"Beginning generation: text_len={len(text)}, tokens_shape={text_tokens.shape}, cfg_weight={cfg_weight}, temperature={temperature}, repetition_penalty={repetition_penalty}")
 
         with torch.inference_mode():
             speech_tokens = self.t3.inference(
@@ -297,5 +362,11 @@ class ChatterboxMultilingualTTS:
                 ref_dict=self.conds.gen,
             )
             wav = wav.squeeze(0).detach().cpu().numpy()
+            # Log generated waveform info for diagnostics
+            try:
+                logger.info(f"Generated waveform: samples={wav.shape[0] if hasattr(wav, 'shape') else len(wav)}, sample_rate={self.sr}")
+            except Exception:
+                logger.debug("Generated waveform info unavailable")
+
             watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
         return torch.from_numpy(watermarked_wav).unsqueeze(0)
